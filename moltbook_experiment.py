@@ -122,30 +122,48 @@ def mb_get(path, params=None):
 
 
 def solve_challenge(challenge_text):
-    """Best-effort solver for the verification math challenge.
-    The exact obfuscation format isn't fully documented -- inspect a real
-    challenge_text and adjust this if it doesn't parse."""
-    nums = [int(n) for n in re.findall(r"-?\d+", challenge_text)]
-    if len(nums) < 2:
-        raise ValueError(f"Could not parse challenge: {challenge_text}")
-    a, b = nums[0], nums[1]
-    if "+" in challenge_text or "plus" in challenge_text.lower():
-        result = a + b
-    elif "-" in challenge_text or "minus" in challenge_text.lower():
-        result = a - b
-    elif "*" in challenge_text or "x" in challenge_text.lower() or "times" in challenge_text.lower():
-        result = a * b
-    else:
-        result = a + b  # default guess
-    return f"{result:.2f}"
+    """Solves the verification math challenge by handing the raw obfuscated
+    text to the LLM rather than trying to regex-parse it. Moltbook scrambles
+    case and injects stray symbols/spaces mid-word (e.g. 'tW eN tY fIvE' for
+    'twenty five') specifically to defeat naive parsers, so this is more
+    robust than pattern matching."""
+    prompt = (
+        "This is an obfuscated math word problem used as a bot-verification "
+        "challenge. The text has randomized letter casing and stray symbols "
+        "mixed in, but the underlying words and numbers are still there once "
+        "you read past the noise. Decode it and solve the math problem.\n\n"
+        f"Challenge text: {challenge_text}\n\n"
+        "Respond with ONLY the final numeric answer, formatted with exactly "
+        "two decimal places (e.g. '18.00'). No words, no explanation, nothing else."
+    )
+    response = call_llm(prompt, system_prompt="You are a precise calculator. You output only numbers.")
+    match = re.search(r"-?\d+\.?\d*", response)
+    if not match:
+        raise ValueError(f"Could not extract a number from LLM answer: {response!r}")
+    return f"{float(match.group()):.2f}"
+
+
+def extract_verification(data):
+    """Moltbook has been observed nesting verification info under
+    result['comment']['verification'] rather than at the top level -- check
+    a few plausible locations."""
+    if data.get("verification_required") and data.get("verification"):
+        return data["verification"]
+    comment = data.get("comment")
+    if isinstance(comment, dict) and comment.get("verificationStatus") == "pending" and comment.get("verification"):
+        return comment["verification"]
+    if data.get("verificationStatus") == "pending" and data.get("verification"):
+        return data["verification"]
+    return None
 
 
 def mb_post(path, payload):
     r = requests.post(f"{MOLTBOOK_BASE}{path}", headers=mb_headers(), json=payload, timeout=30)
     data = r.json()
-    if data.get("verification_required"):
-        code = data["verification"]["code"]
-        challenge = data["verification"].get("challenge_text", "")
+    verification = extract_verification(data)
+    if verification:
+        code = verification.get("verification_code") or verification.get("code")
+        challenge = verification.get("challenge_text", "")
         answer = solve_challenge(challenge)
         v = requests.post(
             f"{MOLTBOOK_BASE}/verify",
@@ -153,7 +171,7 @@ def mb_post(path, payload):
             json={"verification_code": code, "answer": answer},
             timeout=30,
         )
-        return v.json()
+        data["_verification_result"] = v.json()
     return data
 
 
