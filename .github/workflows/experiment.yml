@@ -1,0 +1,39 @@
+name: moltbook-experiment
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours -- few, reliable ticks instead of many unreliable ones
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: moltbook-experiment
+  cancel-in-progress: false  # never kill a run early just because the next tick fired
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355  # just under GitHub's 6h hard cap, leaves buffer for setup/teardown
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests
+
+      - name: Configure git identity for in-script commits
+        run: |
+          git config user.name "moltbook-bot"
+          git config user.email "actions@github.com"
+
+      - name: Run experiment loop for this chunk
+        env:
+          MOLTBOOK_API_KEY: ${{ secrets.MOLTBOOK_API_KEY }}
+          LLM_PROVIDER: groq
+          LLM_MODEL: openai/gpt-oss-120b
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: python moltbook_experiment.py loop --hours 5.75 --interval 1.5 --probe-every 30

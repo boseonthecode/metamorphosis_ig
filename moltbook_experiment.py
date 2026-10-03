@@ -25,6 +25,7 @@ import time
 import re
 import random
 import argparse
+import subprocess
 from datetime import datetime, timezone
 
 import requests
@@ -70,7 +71,43 @@ def log_jsonl(path, record):
         f.write(json.dumps(record) + "\n")
 
 
+def git_push(message):
+    """Commit and push data/ immediately after every write. This means a
+    GitHub Actions job that gets killed mid-run (6-hour cap, or transient
+    failure) still leaves behind everything logged up to that point,
+    instead of losing a whole run's data to a missing end-of-job push."""
+    try:
+        subprocess.run(["git", "add", "data/"], check=True, capture_output=True)
+        commit = subprocess.run(
+            ["git", "commit", "-m", message], capture_output=True, text=True
+        )
+        if commit.returncode != 0:
+            return  # nothing new to commit -- not an error
+        subprocess.run(["git", "push"], check=True, capture_output=True, timeout=60)
+    except Exception as e:
+        print(f"git push skipped/failed (non-fatal): {e}")
+
+
 # ---------------- LLM calls ----------------
+
+def request_with_backoff(method, url, max_retries=5, **kwargs):
+    """Retries on 429 (rate limited) and 5xx with exponential backoff instead
+    of crashing the loop -- needed now that both Moltbook and Groq are being
+    hit much more frequently."""
+    delay = 5
+    for attempt in range(max_retries):
+        r = requests.request(method, url, **kwargs)
+        if r.status_code == 429 or r.status_code >= 500:
+            retry_after = r.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after else delay
+            print(f"[backoff] {url} returned {r.status_code}, waiting {wait:.0f}s (attempt {attempt+1}/{max_retries})")
+            time.sleep(wait)
+            delay = min(delay * 2, 120)
+            continue
+        return r
+    r.raise_for_status()  # exhausted retries, surface the last error
+    return r
+
 
 def call_llm(user_prompt, system_prompt=SYSTEM_PROMPT):
     if LLM_PROVIDER == "ollama":
@@ -90,7 +127,8 @@ def call_llm(user_prompt, system_prompt=SYSTEM_PROMPT):
         return r.json()["message"]["content"]
 
     elif LLM_PROVIDER == "groq":
-        r = requests.post(
+        r = request_with_backoff(
+            "POST",
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
             json={
@@ -116,7 +154,7 @@ def mb_headers():
 
 
 def mb_get(path, params=None):
-    r = requests.get(f"{MOLTBOOK_BASE}{path}", headers=mb_headers(), params=params, timeout=30)
+    r = request_with_backoff("GET", f"{MOLTBOOK_BASE}{path}", headers=mb_headers(), params=params, timeout=30)
     r.raise_for_status()
     return r.json()
 
@@ -158,14 +196,15 @@ def extract_verification(data):
 
 
 def mb_post(path, payload):
-    r = requests.post(f"{MOLTBOOK_BASE}{path}", headers=mb_headers(), json=payload, timeout=30)
+    r = request_with_backoff("POST", f"{MOLTBOOK_BASE}{path}", headers=mb_headers(), json=payload, timeout=30)
     data = r.json()
     verification = extract_verification(data)
     if verification:
         code = verification.get("verification_code") or verification.get("code")
         challenge = verification.get("challenge_text", "")
         answer = solve_challenge(challenge)
-        v = requests.post(
+        v = request_with_backoff(
+            "POST",
             f"{MOLTBOOK_BASE}/verify",
             headers=mb_headers(),
             json={"verification_code": code, "answer": answer},
@@ -187,6 +226,7 @@ def run_probe_battery():
             "response": response,
         })
         time.sleep(1)  # be gentle with local/API rate limits
+    git_push(f"probe log {checkpoint}")
     print(f"[{checkpoint}] probe battery logged ({len(PROBE_BATTERY)} prompts)")
 
 
@@ -223,6 +263,7 @@ def run_cycle():
         action_record["action"] = "skip"
 
     log_jsonl(ACTIONS_LOG, action_record)
+    git_push(f"cycle log {action_record['timestamp']}")
     print(f"[{action_record['timestamp']}] {action_record['action']} on post {post.get('id')}")
 
 
@@ -267,17 +308,18 @@ if __name__ == "__main__":
         run_loop(args.hours, args.interval, args.probe_every)
 
 # ---------------------------------------------------------------------------
-# Running it for free, hands-off, for a day:
+# Running it for free, hands-off, for multiple days:
 #
 # Option A - your own machine:
-#   nohup python moltbook_experiment.py loop --hours 24 --interval 15 --probe-every 60 &
+#   nohup python moltbook_experiment.py loop --hours 168 --interval 15 --probe-every 60 &
 #
 # Option B - GitHub Actions (no machine needs to stay on):
-#   Create .github/workflows/moltbook.yml with a `schedule: cron: "*/15 * * * *"`
-#   trigger that checks out the repo and runs:
-#     python moltbook_experiment.py cycle
-#   and a separate hourly cron step/job running `python moltbook_experiment.py probe`.
-#   Store MOLTBOOK_API_KEY / GROQ_API_KEY as repo secrets. Commit data/*.jsonl back
-#   to the repo at the end of each run (or push to a gist) so it persists between
-#   Actions runs, since each run gets a fresh filesystem.
+#   GitHub's scheduled (cron) triggers are unreliable at short intervals (a
+#   */15-minute schedule can silently slip by hours under platform load).
+#   Long-lived jobs are much steadier, and GitHub allows a single job up to
+#   6 hours. So: cron fires only every ~6 hours (few, reliable ticks), and
+#   each run internally loops for ~5h45m using `loop` mode, which itself
+#   git-pushes after every single probe/cycle -- so even a job killed at the
+#   6-hour cap has already saved everything logged up to that point.
+#   See experiment.yml for the actual workflow.
 # ---------------------------------------------------------------------------
