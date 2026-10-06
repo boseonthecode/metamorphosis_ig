@@ -36,4 +36,4 @@ jobs:
           LLM_PROVIDER: groq
           LLM_MODEL: openai/gpt-oss-120b
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: python moltbook_experiment.py loop --hours 5.75 --interval 1.5 --probe-every 30
+        run: python moltbook_experiment.py loop --hours 5.75 --interval 5 --probe-every 45
