@@ -74,6 +74,25 @@ def git_push(message):
         print(f"git push skipped/failed (non-fatal): {e}")
 
 
+def request_with_backoff(method, url, max_retries=6, **kwargs):
+    """Retries on 429 (rate limited) and 5xx with exponential backoff instead
+    of crashing the whole multi-hour job on the first rate-limit hit."""
+    delay = 10
+    r = None
+    for attempt in range(max_retries):
+        r = requests.request(method, url, **kwargs)
+        if r.status_code == 429 or r.status_code >= 500:
+            retry_after = r.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after else delay
+            print(f"[backoff] {url} returned {r.status_code}, waiting {wait:.0f}s (attempt {attempt+1}/{max_retries})")
+            time.sleep(wait)
+            delay = min(delay * 2, 180)
+            continue
+        return r
+    r.raise_for_status()
+    return r
+
+
 def call_llm(user_prompt, system_prompt=SYSTEM_PROMPT):
     if LLM_PROVIDER == "ollama":
         r = requests.post(
@@ -91,7 +110,8 @@ def call_llm(user_prompt, system_prompt=SYSTEM_PROMPT):
         r.raise_for_status()
         return r.json()["message"]["content"]
     elif LLM_PROVIDER == "groq":
-        r = requests.post(
+        r = request_with_backoff(
+            "POST",
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
             json={
